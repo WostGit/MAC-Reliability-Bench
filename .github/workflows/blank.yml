@@ -1,35 +1,30 @@
-name: MAC-Reliability-Bench - Mini-Agentic-Coding Reliability Benchmark
-
-# ================================================
-# Purpose:
-#   Automatically runs the full Mini-Agentic-Coding Reliability Bench (MAC-Reliability)
-#   Comparing a ~3B teacher model vs its ~0.5B distilled student.
-# ================================================
+name: MAC-Reliability-Bench - MLX on macOS 26
 
 on:
   workflow_dispatch:
     inputs:
-      model_teacher:
-        description: 'Teacher model tag (e.g. qwen2.5:3b)'
+      model_teacher_hf:
+        description: 'Teacher model (mlx-community)'
         required: false
-        default: 'qwen2.5:3b'
-      model_student:
-        description: 'Student model tag (e.g. qwen2.5:0.5b)'
+        default: 'mlx-community/Qwen2.5-3B-Instruct-4bit'
+      model_student_hf:
+        description: 'Student model (mlx-community)'
         required: false
-        default: 'qwen2.5:0.5b'
+        default: 'mlx-community/Qwen2.5-0.5B-Instruct-4bit'
       num_runs:
-        description: 'Runs per task (recommended 5)'
+        description: 'Runs per task'
         required: false
         default: '5'
       max_turns:
-        description: 'Max agent turns per attempt'
+        description: 'Max agent turns per run'
         required: false
-        default: '15'
+        default: '12'
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    runs-on: macos-26
+    timeout-minutes: 150
+
     steps:
       - name: 📋 Checkout repository
         uses: actions/checkout@v4
@@ -39,123 +34,146 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 📦 Install Python dependencies
+      - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pyyaml pytest requests rich tabulate
+          pip install mlx-lm pyyaml pytest requests rich tabulate
 
-      - name: 🦙 Install Ollama
-        run: |
-          curl -fsSL https://ollama.com/install.sh | sh
-          echo "Ollama installed successfully"
+      - name: 🔧 Cache MLX models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface/hub
+          key: mlx-qwen25-${{ inputs.model_teacher_hf }}-${{ inputs.model_student_hf }}
 
-      - name: 🚀 Start Ollama server in background
+      - name: 📁 Setup Benchmark Tasks
+        shell: bash
         run: |
-          ollama serve > ollama.log 2>&1 &
-          sleep 8
-
-      - name: 📥 Pull Models
-        run: |
-          ollama pull ${{ inputs.model_teacher || 'qwen2.5:3b' }}
-          ollama pull ${{ inputs.model_student || 'qwen2.5:0.5b' }}
-
-      - name: 📁 Create benchmark directory structure and sample tasks
-        run: |
-          mkdir -p benchmark/tasks/task_{1..6}
-          mkdir -p benchmark/results
-          cat > benchmark/agent.py << 'EOF'
-          import subprocess
-          import json
-          import re
-          import os
-          import time
+          mkdir -p benchmark/tasks/task_{1..8}
+          
+          # Generate the Agent Script
+          cat > agent_mlx.py << 'AGENTEOF'
+          import subprocess, json, re, time
           from pathlib import Path
           from typing import Dict, List
+          from mlx_lm import load, generate
 
-          def query_model(model: str, prompt: str) -> str:
-              payload = {"model": model, "prompt": prompt, "stream": False, "options": {"temperature": 0.7, "num_ctx": 4096}}
-              try:
-                  r = subprocess.run(["curl", "-s", "http://localhost:11434/api/generate", "-d", json.dumps(payload)], capture_output=True, text=True)
-                  return json.loads(r.stdout).get("response", "ERROR")
-              except: return "ERROR"
+          models_cache = {}
+
+          def get_model(model_id: str):
+              if model_id not in models_cache:
+                  models_cache[model_id] = load(model_id)
+              return models_cache[model_id]
+
+          def query_model(model_id: str, prompt: str):
+              model, tokenizer = get_model(model_id)
+              return generate(model, tokenizer, prompt=prompt, max_tokens=2048, verbose=False)
 
           def run_command(cmd: str, cwd: Path):
               try:
-                  res = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=30)
-                  return {"success": res.returncode == 0, "output": res.stdout + res.stderr}
-              except: return {"success": False, "output": "TIMEOUT"}
+                  r = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=20)
+                  return {"success": r.returncode == 0, "output": r.stdout + r.stderr}
+              except Exception as e:
+                  return {"success": False, "output": str(e)}
 
-          def run_agent():
-              model = os.getenv("MODEL")
-              task_path = Path(os.getenv("TASK_PATH"))
-              max_turns = int(os.getenv("MAX_TURNS", 15))
-              
-              # Minimal loop to verify if the model can fix the code
+          def run_agent(model_id: str, issue: str, repo_path: Path, max_turns: int):
+              history = []
+              start = time.time()
               for turn in range(max_turns):
-                  # In a real bench, the prompt would be built here
-                  # For this CI test, we simulate the agent checking tests
-                  test_result = run_command("python -m pytest", task_path)
-                  if test_result["success"]:
-                      print("PASSED")
-                      return
-              print("FAILED")
+                  prompt = f"Fix this: {issue}. Current files: {list(repo_path.glob('*.py'))}. Reply in JSON."
+                  resp = query_model(model_id, prompt)
+                  try:
+                      action = json.loads(re.search(r'\{.*\}', resp, re.DOTALL).group(0))
+                  except:
+                      action = {"action": "error"}
+                  
+                  if action.get("action") == "edit":
+                      (repo_path / "main.py").write_text(action.get("content", ""))
+                  elif action.get("action") == "submit":
+                      res = run_command("python -m pytest", repo_path)
+                      return {"success": res["success"], "turns": turn+1, "time": time.time()-start}
+              return {"success": False, "turns": max_turns, "time": time.time()-start}
+          AGENTEOF
 
-          if __name__ == "__main__":
-              run_agent()
+          # Generate dummy tasks
+          for i in {1..8}; do
+            cat > "benchmark/tasks/task_$i/main.py" << EOF
+          def compute(x): return x * 1 # Bug
           EOF
+            cat > "benchmark/tasks/task_$i/test_main.py" << EOF
+          from main import compute
+          def test_compute(): assert compute(5) == 10
+          EOF
+          done
 
-          # Create Task 1
-          cat > benchmark/tasks/task_1/main.py << 'EOT'
-          def sum_first_n(n: int): return sum(range(n+1)) # Corrected for demo
-          EOT
-          cat > benchmark/tasks/task_1/test_main.py << 'EOT'
-          from main import sum_first_n
-          def test_sum(): assert sum_first_n(10) == 55
-          EOT
-
-      - name: 🧪 Run Full Reliability Benchmark
+      - name: 🧪 Run & Stream Results
         run: |
           python - << 'PYCODE'
-          import os
-          import subprocess
-          import json
+          import json, sys
           from pathlib import Path
-          from datetime import datetime
           from rich.console import Console
+          from rich.table import Table
+          from rich.panel import Panel
+          import agent_mlx as agent
 
           console = Console()
-          models = ["${{ inputs.model_teacher }}", "${{ inputs.model_student }}"]
-          tasks = list(Path("benchmark/tasks").glob("task_*"))
+          teacher = "${{ inputs.model_teacher_hf }}"
+          student = "${{ inputs.model_student_hf }}"
           num_runs = int("${{ inputs.num_runs }}")
           max_turns = int("${{ inputs.max_turns }}")
-          
-          all_results = {}
+          tasks = sorted(Path("benchmark/tasks").glob("task_*"))
 
-          for model in models:
-              console.rule(f"[bold blue]Testing {model}[/]")
-              all_results[model] = {}
+          results = {teacher: {}, student: {}}
+
+          for model in [teacher, student]:
+              console.rule(f"[bold magenta]Evaluating: {model}[/]")
               for task in tasks:
-                  runs = []
-                  for i in range(num_runs):
-                      console.print(f"  > {task.name} (Run {i+1})")
-                      env = os.environ.copy()
-                      env.update({"MODEL": model, "TASK_PATH": str(task), "MAX_TURNS": str(max_turns)})
-                      
-                      res = subprocess.run(["python", "benchmark/agent.py"], capture_output=True, text=True, env=env)
-                      runs.append({"run": i+1, "success": "PASSED" in res.stdout})
-                  all_results[model][task.name] = runs
+                  run_outcomes = []
+                  for r in range(num_runs):
+                      res = agent.run_agent(model, "Fix the compute function", task, max_turns)
+                      run_outcomes.append(res)
+                      status = "[green]✔[/]" if res["success"] else "[red]✘[/]"
+                      console.print(f"  {task.name} Run {r+1}: {status}")
+                  results[model][task.name] = run_outcomes
 
-          # Save Report
-          with open("benchmark/results/report.md", "w") as f:
-              f.write("# MAC-Reliability Report\n")
-              for model, tasks in all_results.items():
-                  successes = sum(1 for t_runs in tasks.values() for r in t_runs if r["success"])
-                  total = len(tasks) * num_runs
-                  f.write(f"## {model}\nSuccess Rate: {successes/total*100:.1f}%\n")
+          # Generate Final Console Report
+          console.print("\n")
+          console.rule("[bold cyan]FINAL COMPARISON REPORT[/]")
+          
+          table = Table(title="Model Reliability Baseline", show_header=True, header_style="bold")
+          table.add_column("Task ID", style="dim")
+          table.add_column(f"Teacher ({teacher})", justify="center")
+          table.add_column(f"Student ({student})", justify="center")
+          table.add_column("Status", justify="right")
+
+          for task in [t.name for t in tasks]:
+              t_pass = sum(1 for r in results[teacher][task] if r["success"])
+              s_pass = sum(1 for r in results[student][task] if r["success"])
+              
+              diff = ""
+              if t_pass > s_pass:
+                  diff = "[yellow]Student Lagging[/]"
+              elif t_pass == s_pass and t_pass > 0:
+                  diff = "[green]Matched[/]"
+              else:
+                  diff = "[red]Baseline Failure[/]"
+
+              table.add_row(
+                  task, 
+                  f"{t_pass}/{num_runs}", 
+                  f"{s_pass}/{num_runs}", 
+                  diff
+              )
+
+          console.print(table)
+          
+          t_total = sum(sum(1 for r in tasks_runs if r["success"]) for tasks_runs in results[teacher].values())
+          s_total = sum(sum(1 for r in tasks_runs if r["success"]) for tasks_runs in results[student].values())
+          total_poss = len(tasks) * num_runs
+
+          console.print(Panel(
+              f"[bold]Aggregate Score[/]\n"
+              f"Teacher Baseline: {t_total}/{total_poss} ({ (t_total/total_poss)*100:.1f}%)\n"
+              f"Student Performance: {s_total}/{total_poss} ({ (s_total/total_poss)*100:.1f}%)",
+              title="Summary", expand=False
+          ))
           PYCODE
-
-      - name: 📊 Upload Results
-        uses: actions/upload-artifact@v4
-        with:
-          name: mac-reliability-results
-          path: benchmark/results/
